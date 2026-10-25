@@ -649,12 +649,15 @@ func (c *Config) normalize() error {
 	return c.normalizePrompt()
 }
 
-// normalizePrompt 校验 prompt.mode 并按 file 加载提示词文本（custom/append 模式）。
+// normalizePrompt 校验 prompt.mode 并按 file 加载提示词文本。
 //
 // mode 非法（非 passthrough/custom/append）启动报错，避免静默回落到某一分支；
 // custom/append 模式下 file 非空但不可读 → 报错（fail fast），file 空 → 用内置默认
-// （两模式共用同一加载路径，PromptText 均非空）。
-// passthrough 模式不加载文本（透传客户端原始 system，文本在降级时用 prompt.Degraded）。
+// 提示词（两模式共用同一加载路径，PromptText 均非空）。
+//
+// fork 变更：passthrough 模式也加载文本（可读则加载，读失败不阻断——透传模式
+// 本身不需要它）。原因：请求头 X-Prompt-Mode 可把单个请求切到 custom/append，
+// 文本必须已在内存，否则全局 passthrough 下带头切 custom 会静默空转。
 func (c *Config) normalizePrompt() error {
 	switch m := strings.ToLower(strings.TrimSpace(c.Prompt.Mode)); m {
 	case "", "passthrough":
@@ -666,13 +669,14 @@ func (c *Config) normalizePrompt() error {
 	default:
 		return fmt.Errorf("prompt.mode: %q 不是合法值（passthrough / custom / append）", c.Prompt.Mode)
 	}
-	if c.Prompt.Mode == "custom" || c.Prompt.Mode == "append" {
-		text, err := prompt.Load(c.Prompt.Mode, c.Prompt.File)
-		if err != nil {
+	text, err := prompt.Load(c.Prompt.Mode, c.Prompt.File)
+	if err != nil {
+		if c.Prompt.Mode != "passthrough" {
 			return err
 		}
-		c.PromptText = text
+		text = "" // 透传模式文本仅服务请求头覆盖，读不到就退化为无覆盖，不阻断启动
 	}
+	c.PromptText = text
 	return nil
 }
 

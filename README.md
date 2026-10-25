@@ -1074,3 +1074,40 @@ sudo chown -R 10001:10001 ./auths ./data ./config.json
 Web 面板「账号池与流量治理」可分别配置策略和账号顺序，保存后热生效。闲置补偿与快过期积分加权仅影响加权随机。无地区上下文的旧 Pool 入口保留原行为；策略不会改变路由或自动跨地区借号。
 
 本功能不假定国际版免费模型已采用五小时限额；限流及恢复时间继续依据现有上游识别逻辑处理，不硬编码五小时。
+
+---
+
+## Fork 说明（honlam6）：X-Prompt-Mode 请求级提示词模式覆盖
+
+上游已停止维护（2026-10-21）。本 fork 在原版基础上加了一个小功能：**按请求分流系统提示词模式**，解决「编码 agent 工具要人格伪装（custom）、OpenAI 直连客户端要纯透传（passthrough）」共用一个网关的冲突——不再需要全局切模式 + 重启。
+
+### 用法
+
+全局配置保持 `prompt.mode: "custom"`（或任意值）。客户端在请求头里带：
+
+```
+X-Prompt-Mode: passthrough     # 本请求透传客户端 system
+X-Prompt-Mode: custom          # 本请求用网关人格替换 system
+X-Prompt-Mode: append          # 本请求在客户端 system 后追加网关人格
+```
+
+- 头值大小写不敏感、容忍首尾空白；**非法值静默回落全局**，不打挂请求。
+- 不带头的请求完全走全局模式，原版行为零改变。
+- 降级期（内容拦截误报触发）按覆盖后的模式执行原有降级裁决。
+
+### 行为变更（相对上游）
+
+- `normalizePrompt` 在全局 passthrough 下也预载提示词文本（原来不加载）——否则全局 passthrough 时带头切 custom 会静默空转。文本读不到时不阻断启动（该场景仅请求头覆盖用得上它）。
+
+### 客户端示例（OpenAI SDK / 任意 HTTP 客户端）
+
+```python
+import urllib.request, json
+req = urllib.request.Request(url, data=json.dumps(payload).encode(), method="POST")
+req.add_header("Authorization", "Bearer <api_key>")
+req.add_header("X-Prompt-Mode", "passthrough")   # 就这一行
+```
+
+### 测试
+
+`internal/server/prompt_mode_header_test.go`：6 项（无头保持全局 / 头透传覆盖 custom / 头 custom 覆盖 passthrough / 头值归一 / 非法值回落 / 全局 passthrough 回归）。

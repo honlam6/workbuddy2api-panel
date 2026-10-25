@@ -676,7 +676,9 @@ func TestPromptDefaultPassthrough(t *testing.T) {
 	// passthrough 不加载提示词文本（透传客户端 system）；切 custom 时 normalize 会加载。
 }
 
-// TestPromptExplicitPassthrough passthrough 模式不加载文本（透传客户端原始 system）。
+// TestPromptExplicitPassthrough passthrough 模式也预载文本（fork 变更：请求头
+// X-Prompt-Mode 可把单请求切到 custom/append，文本必须已在内存；file 未配置时
+// 加载内置默认，同样非空）。
 func TestPromptExplicitPassthrough(t *testing.T) {
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "c.json")
@@ -688,8 +690,8 @@ func TestPromptExplicitPassthrough(t *testing.T) {
 	if c.Prompt.Mode != "passthrough" {
 		t.Errorf("mode=%q want passthrough", c.Prompt.Mode)
 	}
-	if c.PromptText != "" {
-		t.Errorf("passthrough should not load PromptText, got len=%d", len(c.PromptText))
+	if c.PromptText == "" {
+		t.Errorf("passthrough should preload PromptText for per-request override, got empty")
 	}
 }
 
