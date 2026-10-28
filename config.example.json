@@ -8,7 +8,8 @@
     "read_timeout": "300s"
   },
   "panel": {
-    "package_detail_limit": 5
+    "package_detail_limit": 5,
+    "poll_interval_sec": 0
   },
   "logging": {
     "request_archive_enabled": true,
@@ -101,5 +102,8 @@
     "enabled": true,
     "ttl": "30m",
     "gc_interval": "5m"
+  },
+  "notify": {
+    "wecom_webhook": ""
   }
 }

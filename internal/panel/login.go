@@ -113,6 +113,37 @@ func doJSON(method, fullURL, bearer string, body io.Reader, origin string) (json
 	return env.Data, resp.StatusCode, nil
 }
 
+// beginLogin 发起设备授权并登记 state，返回 (state, authUrl)。
+// loginStart 与 accountRelogin 共用，避免重复实现。
+func (p *Panel) beginLogin(realm string) (string, string, error) {
+	if realm != "global" {
+		realm = "cn"
+	}
+	epState, _, _, origin := loginEndpoints(realm)
+	data, status, err := doJSON(http.MethodPost, epState, "", bytes.NewReader([]byte("{}")), origin)
+	if err != nil {
+		return "", "", fmt.Errorf("auth state (upstream %d): %v", status, err)
+	}
+	var st struct {
+		State   string `json:"state"`
+		AuthURL string `json:"authUrl"`
+	}
+	if err := json.Unmarshal(data, &st); err != nil || st.State == "" || st.AuthURL == "" {
+		return "", "", fmt.Errorf("auth state: missing state or authUrl")
+	}
+	p.loginMu.Lock()
+	// 顺手回收过期会话，防"开弹窗走开"的 state 滞留。
+	for s, sess := range p.logins {
+		if time.Since(sess.created) > loginTTL {
+			delete(p.logins, s)
+		}
+	}
+	p.logins[st.State] = loginSession{created: time.Now(), realm: realm}
+	p.loginMu.Unlock()
+	log.Printf("panel: 发起 OAuth 添加账号 realm=%s（state=%s...）", realm, st.State[:min(8, len(st.State))])
+	return st.State, st.AuthURL, nil
+}
+
 // loginStart 发起设备授权：POST auth/state 拿授权 URL。
 // body 可带 {"realm":"global"}（缺省 cn）；state 会话记 realm，poll 同 realm 落盘。
 func (p *Panel) loginStart(w http.ResponseWriter, r *http.Request) {
@@ -127,31 +158,12 @@ func (p *Panel) loginStart(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	epState, _, _, origin := loginEndpoints(realm)
-	data, status, err := doJSON(http.MethodPost, epState, "", bytes.NewReader([]byte("{}")), origin)
+	state, authURL, err := p.beginLogin(realm)
 	if err != nil {
-		writeErr(w, http.StatusBadGateway, fmt.Sprintf("auth state (upstream %d): %v", status, err))
+		writeErr(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	var st struct {
-		State   string `json:"state"`
-		AuthURL string `json:"authUrl"`
-	}
-	if err := json.Unmarshal(data, &st); err != nil || st.State == "" || st.AuthURL == "" {
-		writeErr(w, http.StatusBadGateway, "auth state: missing state or authUrl")
-		return
-	}
-	p.loginMu.Lock()
-	// 顺手回收过期会话，防"开弹窗走开"的 state 滞留。
-	for s, sess := range p.logins {
-		if time.Since(sess.created) > loginTTL {
-			delete(p.logins, s)
-		}
-	}
-	p.logins[st.State] = loginSession{created: time.Now(), realm: realm}
-	p.loginMu.Unlock()
-	log.Printf("panel: 发起 OAuth 添加账号 realm=%s（state=%s...）", realm, st.State[:min(8, len(st.State))])
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "url": st.AuthURL, "state": st.State, "realm": realm})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "url": authURL, "state": state, "realm": realm})
 }
 
 // loginPoll 轮询登录态。未完成 → {done:false}；完成 → 建凭证、落盘、热加载、签到。
@@ -280,11 +292,12 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 	delete(p.logins, state)
 	p.loginMu.Unlock()
 	log.Printf("panel: 新账号已热加载 uid=%s nickname=%q realm=%s（免重启生效）", acct.UID, acct.Nickname, sess.realm)
-	// 企业切换会话预警：该形态下 /v2/report 行为事件被上游静默丢弃（200 不计分），
-	// 成长任务全部无法点亮（签到/列表/额度/领养照常）。当场给出修复路径，
-	// 避免用户事后对着「已上报但进度 0/x」排查（见 auth.IsEnterpriseSession）。
-	if a.IsEnterpriseSession() && !a.IsEnterprise() {
-		log.Printf("panel: WARN uid=%s 的凭证为企业切换会话（token_source=enterprise_switch）：成长任务行为事件会被上游静默丢弃；建议移除该账号，在浏览器退出企业切换（个人身份）后重新登录", acct.UID)
+	// 真企业版预警：enterpriseId 非空 → 上游无个人成长体系（growth 端点 400
+	// code 10001 / 403 growth-only），成长任务注定失败，当场给出修复路径。
+	// 仅带 token_source=enterprise_switch 的个人版**不**预警：实测其行为事件
+	// 照常计分（issue #240 实测修正，旧口径误伤了大批可用账号）。
+	if a.IsEnterprise() {
+		log.Printf("panel: WARN uid=%s 为企业版（enterpriseId 非空），无个人成长体系；建议移除该账号或改用个人身份账号", acct.UID)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"done":            true,
@@ -294,6 +307,53 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		"credits":         remain,
 		"credits_total":   total,
 		"checkin_message": checkinMsg,
+	})
+}
+
+// accountRelogin 发起重新登录并把二维码推送到企业微信（若配置了 webhook）。
+// UI 入口："重登推送"按钮；也供运维直接 curl 调用。
+func (p *Panel) accountRelogin(w http.ResponseWriter, r *http.Request) {
+	uid := r.PathValue("uid")
+	st, ok := p.cfg.Pool.Status(uid)
+	if !ok {
+		writeErr(w, http.StatusNotFound, "account not found")
+		return
+	}
+	realm := "cn"
+	if a := p.cfg.Pool.AuthByUID(uid); a != nil {
+		realm = a.Realm()
+	}
+	state, authURL, err := p.beginLogin(realm)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	nickname := st.Nickname
+	notified := false
+	var sendErr string
+	webhook := p.cfg.WecomWebhook
+	if p.cfg.Live != nil {
+		if w := p.cfg.Live.Load().WecomWebhook; w != "" {
+			webhook = w
+		}
+	}
+	if webhook != "" {
+		if err := sendWeComLoginQR(webhook, nickname, uid, authURL); err != nil {
+			sendErr = err.Error()
+			log.Printf("panel: relogin uid=%s wecom push failed: %v", uid, err)
+		} else {
+			notified = true
+		}
+	} else {
+		sendErr = "wecom webhook not configured (notify.wecom_webhook empty / live empty)"
+	}
+	log.Printf("panel: relogin uid=%s state=%s... notified=%v", uid, state[:min(8, len(state))], notified)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":       true,
+		"state":    state,
+		"url":      authURL,
+		"notified": notified,
+		"message":  sendErr,
 	})
 }
 

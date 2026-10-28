@@ -951,6 +951,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <label class="fld"><span class="lb">单账号明细默认展示条数</span>
               <input name="package_detail_limit" type="number" min="1" placeholder="5">
               <span class="hint">积分构成页按最早到期展示，其余未用完包聚合</span></label>
+            <label class="fld"><span class="lb">面板自动刷新间隔（秒）</span>
+              <input name="poll_interval_sec" type="number" placeholder="0">
+              <span class="hint">0 = 缺省 5 秒；负数 = 关闭自动刷新（仅手动更新）。页面切到后台时自动暂停。</span></label>
           </div>
         </div>
 
@@ -1135,6 +1138,16 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <div class="switch"><span class="lb">会话粘性路由</span>
               <input type="checkbox" name="session_sticky_enabled"></div>
             <div class="hint" style="margin-top:10px">Upstash Redis 镜像、凭证目录与状态文件路径需手工编辑配置文件（判为重启项）。</div>
+          </div>
+        </div>
+
+        <div class="box">
+          <header><h3>通知（重登推送）</h3></header>
+          <div class="pad">
+            <label class="fld"><span class="lb">企业微信机器人 Webhook</span>
+              <input name="wecom_webhook" placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...">
+              <span class="hint">空 = 禁用登录二维码推送（重登时仅返回授权链接）；保存后立即生效</span></label>
+            <div class="hint" style="margin-top:10px">获取方式：企微群 → 添加机器人 → 复制 webhook 地址。保存后在账号列表「重登推送」按钮可把登录二维码发到企微。</div>
           </div>
         </div>
 

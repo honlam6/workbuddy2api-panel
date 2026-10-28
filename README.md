@@ -173,6 +173,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | **请求指标与脱敏日志** | 面板展示完成成功率 / HTTP 成功率 / 平均耗时 / 最近请求，响应带 `X-Request-Id`；JSONL 只归档请求元数据，不写提示词、响应正文或凭证 |
 | **浏览器内 OAuth 添加账号** | 面板「添加账号」按钮完成设备授权 → 凭证落盘 → **热加载进池（免重启）**，替代命令行 `login.sh` 流程 |
 | **在线配置编辑（热生效）** | 面板直接改 `config.json`：API 密钥 / `soft_rate` / 脱敏开关 / 池参数 / 任务排程**立即生效**；装配期字段（listen 等）保存后提示需重启。写入采用深合并 + 原子替换，保留未知键 |
+| **企业微信重登推送** | 账号行「重登推送」：发起新的 OAuth 设备登录，并把授权链接 + 二维码推送到企业微信机器人 Webhook，转发给账号持有人扫码；用于刷新过期账号凭证。webhook 在面板「通知」页热更新（`notify.wecom_webhook`，空则禁用） |
 | **积分任务体系** | 任务列表 / 接受 / 领取接口 + 面板弹窗；「一键完成」覆盖 **17 个任务**（对话 / 领养 / 桌面行为链 / 模板 / 灵感案例 / 画布 / 专家召唤 / 技能尝鲜 / 主题 / 资料库 / 夜猫子等），推进进度、等待异步计分落定后**自动领奖**，纯 API 零客户端依赖 |
 | **限时补偿可观测（issue #189）** | 官方补偿（例：「模型服务异常额外补偿 500 积分」）在账号侧可见，网关改为**先查 `compensation-status` 再决定是否领**：面板「官方补偿」卡片列出待领账号 + 领取截止倒计时（≤48h 标红）+ 逐号/全量领取按钮；**查询失败的账号在卡片上显形为红色行，不会与「没有补偿」混为一谈**；每日签到排程同步走「查→领」，**状态查询失败与领取失败一律显式告警**（旧实现把「没有 / 已领 / 领取失败」三态压成同一形态，带截止日的补偿会静默过期） |
 | **首启自动生成配置** | 目录下无 `config.json` 时自动生成推荐配置（含 `crypto/rand` 随机 `api_key`），双击即开 |
@@ -236,7 +237,7 @@ flowchart LR
 
 ### 方式〇：GHCR 镜像（免克隆免构建）
 
-CI 会自动构建多架构镜像（`amd64` / `arm64`）并发布到 GHCR，`git clone` 之外的部署路径：
+CI 会自动构建多架构镜像（`amd64` / `arm64`）并发布到 GHCR；同时发布 **GitHub Release**：预编译五平台静态二进制（`linux/darwin` × `amd64/arm64` + `windows/amd64`）与 `amd64/arm64` 的 `.deb` 包，并生成 `checksums.txt`。`git clone` 之外的部署路径：
 
 ```bash
 # 1. 准备配置与数据目录
@@ -367,6 +368,85 @@ curl -s http://localhost:7863/v1/search/messages \
        "messages":[{"role":"user","content":"Perform a web search for the query: OpenAI 最新模型"}]}'
 ```
 
+## 客户端接入
+
+### Claude Code（Anthropic Messages 协议）
+
+Claude Code 用的是 **Anthropic Messages** 协议（`POST /v1/messages`），而本网关对
+普通客户端只暴露 **OpenAI 兼容**接口（`POST /v1/chat/completions`）。所以不能把
+`base_url` 直指本网关的 `/v1/chat/completions`——那会让 Claude Code 以为拿到的是
+Anthropic 端点，实际发过去的是 OpenAI 形态的 body，响应也对不上。
+
+两条可行路径：
+
+**路径 A：用 claude-code-router 做协议翻译（不改网关）**
+
+claude-code-router 负责把 Anthropic 协议转成 OpenAI 协议，转发到本网关：
+
+```json
+{
+  "LOG": true,
+  "APIKEY": "your-api-key",
+  "Providers": [
+    {
+      "name": "workbuddy",
+      "api_base_url": "http://127.0.0.1:7863/v1/chat/completions",
+      "models": ["cn:glm-5.3", "cn:deepseek-v4-pro", "global:hy3"]
+    }
+  ],
+  "Router": { "default": "workbuddy" }
+}
+```
+
+注意 `api_base_url` 要写到**完整路径** `/v1/chat/completions`（不是只到 `/v1`）。
+
+**路径 B：直接用 OpenAI 兼容客户端**
+
+Cherry Studio、NextChat、LobeChat、Open WebUI、dsh 等都原生支持 OpenAI 形态，
+直接指 `http://127.0.0.1:7863/v1` + 本网关的 `api_key` 即可，无需任何中间层。
+
+### 模型名必须带 `cn:` / `global:` 域前缀
+
+`GET /v1/models` 返回的模型 id 形如 `cn:glm-5.3`、`global:deepseek-v4.1-flash`。
+**调用时也必须带同样的前缀**：
+
+| 写法 | 含义 |
+|---|---|
+| `cn:glm-5.3` | 显式国内域 |
+| `global:glm-5.3` | 显式国际域 |
+| `glm-5.3`（裸名） | **按国内域处理** |
+
+前缀解析规则（`internal/server/resolve_model.go`）：取第一个 `:`，前段恰为
+`cn` / `global` 才剥离；其余一律当裸名走国内域。大小写敏感（必须是精确的小写枚举）。
+
+**这是最容易踩的坑**：池里只有国际版账号时，写裸名 `glm-5.3` 会被派到国内域找号，
+一个都没有，于是返回：
+
+```json
+{"error":{"code":"no_healthy_account",
+  "gateway_hint":"no healthy account available in pool; check /status or retry later"}}
+```
+
+这个报错读起来像「账号全挂了 / 池子空了」，实际只是**模型名少了前缀**。
+
+### 常见错误对照表
+
+| 现象 | 原因 | 处置 |
+|---|---|---|
+| `no_healthy_account` | 模型名缺 `cn:`/`global:` 前缀，域路由错 | 按上表加前缀 |
+| `no_healthy_account` | 账号全在冷却 / 熔断 / 禁用 | 看面板首页状态列与 `/status` |
+| `model_unavailable` + `11158` | 账号档位不支持该模型（如免费个人号用 GPT-6.x） | 换该档位支持的模型，或换号 |
+| `model_unavailable` + `11102` | 上游该后端无此模型 | 换模型 |
+| 400 + 内容审核文案 | 上游逐字匹配误杀官方 system 模板 | 网关已有降级重试，见「内容拦截误报与降级重试」 |
+| 工具调用丢失 | 客户端与网关的 tool schema 形态不匹配 | 确认客户端发标准 OpenAI `tools` 字段 |
+| claude-code-router 连不上 | `api_base_url` 写成了 `/v1` 而非完整路径 | 改成 `/v1/chat/completions` |
+
+### Windows 注意点
+
+- `node` 需在 `PATH` 里（claude-code-router 依赖它）；
+- `.bat` 脚本需 **CRLF** 换行（LF 会导致 Windows 解析异常）；
+- 网关的工作目录必须是仓库根（`config.json` / `auths/` / `data/` 都是相对路径解析）。
+
 ## 配置说明
 
 **`config.example.json` 是配置项最完整的参考**：每个字段、默认值与结构都能在其中找到，示例值一律是 `test_key` 之类占位符，**不含任何真实密钥**。下表为字段含义速查。
@@ -382,6 +462,7 @@ curl -s http://localhost:7863/v1/search/messages \
 | `dns_servers` | 空 | **出站解析**用的 DNS 服务器（数组，按顺序试，都用不上才报错）；空 = 系统解析器。/etc/resolv.conf 不存在或不可用的环境（Android、精简容器）必须显式配，否则 Go 解析器会退回 `127.0.0.1:53`，查任何域名都变成"连本机 53 端口"（`dial tcp: lookup ... on [::1]:53: connection refused`）。只换 `Transport.DialContext`，不动超时与连接池 |
 | `server.read_timeout` | `300s` | 入站请求读取（含 body 上传）总时长上限；大上下文/文件块经反代转发超时会 400 `read body: i/o timeout`；`0` = 不限制；改动需重启（#100） |
 | `panel.package_detail_limit` | `5` | 积分构成页单账号默认展示的最早到期包数；其余未用完包与已用完包聚合折叠 |
+| `panel.poll_interval_sec` | `0` | 面板自动刷新间隔（秒）。`0` = 缺省 5 秒；**负数 = 关闭自动刷新**（只在手动操作时更新）。页面切到后台时自动暂停轮询，回前台立刻补拉一次。账号多、或只把面板当监控用时，调大间隔能显著降低浏览器与服务端负担 |
 | `logging.request_archive_enabled` | `true` | 请求元数据 JSONL 归档开关；不记录提示词、响应正文或 Authorization |
 | `logging.request_retention_days` | `7` | 请求归档保留天数；超期文件在启动和周期清理时删除 |
 | `logging.request_archive_max_mb` | `100` | 请求归档总容量上限（MiB）；超限优先删除最旧文件 |
@@ -404,6 +485,7 @@ curl -s http://localhost:7863/v1/search/messages \
 | `upstream.user_agent` | 空 | 出站 User-Agent 覆盖（空 = 现状 `CLI/2.63.2 CodeBuddy/2.63.2`）。官网「使用端」列按出站 UA 服务端归因；官方 WorkBuddy 桌面 UA 为 `WorkBuddy/<version>`，需要时可配 |
 | `features.sanitize_blacklist_fingerprints` | `true` | 出站请求体黑名单指纹脱敏 |
 | `models.hidden` | `[]` | 模型黑名单：不对外暴露的模型。裸名=两域都藏；`"cn:xxx"`/`"global:xxx"`=只藏该域。`GET /v1/models` 列表过滤 + `POST /v1/chat/completions` 点名拒绝（400 `model_unavailable`）。面板保存后热生效 |
+| `notify.wecom_webhook` | 空 | **企业微信机器人 Webhook**：非空时账号行「重登推送」把新 OAuth 授权链接 + 登录二维码推送到企业微信，便于转给账号持有人扫码登录 / 刷新过期凭证；面板「配置 → 通知」支持热更新（空 = 禁用推送，仅返回链接） |
 | `prompt.mode` | `custom` | 系统提示词模式：`custom` = 网关用自有提示词替换客户端 system；`append` = 开头连续 system/developer 块后插网关提示词（既有消息逐字不动）；`passthrough` = 透传客户端原始 system（降级重试仍切中性提示词） |
 | `prompt.file` | 空 | 提示词文件路径；空 = 内置默认（约 2KB）；路径非空但不可读 → 启动报错 |
 | `upstash.url` / `upstash.token` | 空 | 空 = 纯内存模式（Noop 降级，功能照常） |
@@ -947,9 +1029,9 @@ python3 scripts/probe_max_tokens.py   --base http://127.0.0.1:7863/v1 --key sk-x
 
 ### 3. 发布来源与合规边界
 
-- **无预编译 release**：仓库无 Release / tag，产物 = 源码自构建（Dockerfile 多阶段在本地构建时完成）
+- **预编译 Release**：`git push` 一个 `vX.Y.Z` tag 即触发 GitHub Actions——产出五平台静态二进制（`linux/darwin` × `amd64/arm64` + `windows/amd64`）与 `amd64/arm64` 的 `.deb` 安装包，并生成 `checksums.txt`；`.deb` 安装后自动创建 `workbuddy2api` 系统用户、落默认配置并 enable/start `workbuddy2api.service`（监听 `:7863`）。也可继续从源码自构建（Dockerfile 多阶段）
 - 登录 / 签到 / 积分工具：`./login.sh` / `./signin.sh` / `./credit.sh`
-- **无产物校验和**：`go.sum` 仅约束 Go 模块依赖；Docker 镜像由本地 `docker compose build` 生成，未引用第三方镜像
+- **有产物校验和**：所有 Release 二进制 / `.deb` 均附 `checksums.txt`，可用 `sha256sum -c checksums.txt` 校验；Docker 镜像由本地 `docker compose build` 生成
 - 上游 CodeBuddy 属腾讯系商业产品，本项目是其**非官方 OpenAI 兼容网关**；使用其账号做 API 网关涉及目标平台服务条款与账号风险，作者不对账号封禁、条款违约或使用结果负责
 
 ### 4. 授权使用边界

@@ -29,6 +29,10 @@ type Config struct {
 	Panel struct {
 		// PackageDetailLimit 积分构成页单账号默认展示的最近到期包数；<=0 回落 5。
 		PackageDetailLimit int `json:"package_detail_limit"`
+		// PollIntervalSec 面板自动刷新间隔（秒）。0 = 用前端缺省（5s）；
+		// 负值 = 关闭自动刷新（只在手动操作时更新）。账号多、或只是开着面板
+		// 当监控用时，调大间隔能显著降低浏览器与服务端负担。
+		PollIntervalSec int `json:"poll_interval_sec"`
 	} `json:"panel"`
 
 	Logging struct {
@@ -173,6 +177,12 @@ type Config struct {
 		// SanitizeBlacklistFingerprints 出站请求体黑名单指纹脱敏（默认 true；false 完全还原）。
 		SanitizeBlacklistFingerprints bool `json:"sanitize_blacklist_fingerprints"`
 	} `json:"features"`
+
+	Notify struct {
+		// WecomWebhook 企业微信机器人 webhook URL（空=禁用登录二维码推送）。
+		// 用于"重登推送"功能把 OAuth 登录链接/二维码发到企业微信，转发给账号持有人扫码。
+		WecomWebhook string `json:"wecom_webhook"`
+	} `json:"notify"`
 
 	Models struct {
 		// Hidden 不对外暴露的模型黑名单。裸名=两域都藏；"cn:xxx"/"global:xxx"=只藏该域。
@@ -479,6 +489,8 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("WB2A_PROMPT_FILE"); v != "" {
 		c.Prompt.File = v
+		if v := os.Getenv("WB2A_WECOM_WEBHOOK"); v != "" {
+		c.Notify.WecomWebhook = v
 	}
 	if v := os.Getenv("WB2A_EXPIRING_SOON"); v != "" {
 		c.Pool.ExpiringSoon = v
@@ -492,6 +504,7 @@ func applyEnv(c *Config) {
 		c.DNSServers = splitCSV(v)
 	}
 }
+}
 
 func (c *Config) normalize() error {
 	var err error
@@ -501,6 +514,8 @@ func (c *Config) normalize() error {
 	if c.Panel.PackageDetailLimit <= 0 {
 		c.Panel.PackageDetailLimit = 5
 	}
+	// PollIntervalSec 不做回落：0 = 缺省（前端 5s），负数 = 关闭自动刷新。
+	// 两者都是合法取值，normalize 必须原样保留（回落会把「关闭」变成「5 秒」）。
 	if c.Logging.RequestRetentionDays <= 0 {
 		c.Logging.RequestRetentionDays = 7
 	}
