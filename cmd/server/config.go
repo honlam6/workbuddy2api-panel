@@ -199,6 +199,11 @@ type Config struct {
 		// File 提示词文件路径；空 = 内置默认 defaultprompt.md；
 		// 路径非空但不可读 → 启动报错（fail fast，避免静默回落到内置默认）。
 		File string `json:"file"`
+		// PassthroughModels 模型级透传名单（fork）：X-Prompt-Mode 头未给有效值时，
+		// 请求模型（全名 global:hy4free 或裸名 hy4free，大小写不敏感）命中名单 →
+		// 该请求透传客户端原始 system（ERP 专用模型无需人格伪装）。头显式给值仍优先。
+		// 空 = 关闭（零回归）。
+		PassthroughModels []string `json:"passthrough_models,omitempty"`
 	} `json:"prompt"`
 
 	// PromptText 解析后的系统提示词文本（custom/append 模式使用）。

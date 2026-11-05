@@ -14,7 +14,8 @@ import (
 // promptModeHeaderTest 发一次对话请求，捕获出站 body。
 // 返回 (含网关人格文本, 含客户端原 system 文本)——出站协议字段顺序不定，
 // 用包含性断言替代位置断言。
-func promptModeHeaderOutbound(t *testing.T, globalMode, globalText, header string) (bool, bool) {
+// model 为请求体里的模型名；ptModels 为 prompt.passthrough_models 名单（fork）。
+func promptModeHeaderOutbound(t *testing.T, globalMode, globalText, header, model string, ptModels []string) (bool, bool) {
 	t.Helper()
 	var outbound []byte
 	up := &upstream.Client{
@@ -27,11 +28,20 @@ func promptModeHeaderOutbound(t *testing.T, globalMode, globalText, header strin
 			}, nil
 		})},
 	}
-	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
-	h := NewHandler(Config{Pool: p, Upstream: up, PromptMode: globalMode, PromptText: globalText})
+	// 池里同时放 CN + global 账号：名单用例的 global:hy4free 与基线用例的
+	// cn 裸名模型都要能选到号（否则 503 no_healthy_account，与提示词无关）。
+	p := testPoolWith(
+		&auth.Auth{UID: "cn1", Domain: "www.codebuddy.cn", AccessToken: "at-cn", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "gl1", Domain: "www.workbuddy.ai", AccessToken: "at-gl", ExpiresAt: 9999999999},
+	)
+	h := NewHandler(Config{Pool: p, Upstream: up, PromptMode: globalMode, PromptText: globalText,
+		PromptPassthroughModels: ptModels})
 
+	if model == "" {
+		model = "glm-5.2"
+	}
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(
-		`{"model":"glm-5.2","messages":[{"role":"system","content":"CLIENT-SYS-MARKER"},{"role":"user","content":"hi"}]}`))
+		`{"model":"`+model+`","messages":[{"role":"system","content":"CLIENT-SYS-MARKER"},{"role":"user","content":"hi"}]}`))
 	if header != "" {
 		req.Header.Set("X-Prompt-Mode", header)
 	}
@@ -49,7 +59,7 @@ func promptModeHeaderOutbound(t *testing.T, globalMode, globalText, header strin
 
 // 全局 custom、无头：网关人格替换客户端 system（原有行为不因 fork 改变）。
 func TestPromptModeHeaderAbsentKeepsGlobalCustom(t *testing.T) {
-	gw, client := promptModeHeaderOutbound(t, "custom", "GATEWAY-PERSONA-MARKER", "")
+	gw, client := promptModeHeaderOutbound(t, "custom", "GATEWAY-PERSONA-MARKER", "", "", nil)
 	if !gw || client {
 		t.Fatalf("gateway=%v client=%v，want gateway 文本替换且客户端 system 被清除", gw, client)
 	}
@@ -58,7 +68,7 @@ func TestPromptModeHeaderAbsentKeepsGlobalCustom(t *testing.T) {
 // 全局 custom + 头 passthrough：本请求透传客户端 system（fork 核心场景：
 // 编码 agent 走全局人格伪装，ERP 等 OpenAI 直连客户端带头即透传）。
 func TestPromptModeHeaderPassthroughOverridesCustom(t *testing.T) {
-	gw, client := promptModeHeaderOutbound(t, "custom", "GATEWAY-PERSONA-MARKER", "passthrough")
+	gw, client := promptModeHeaderOutbound(t, "custom", "GATEWAY-PERSONA-MARKER", "passthrough", "", nil)
 	if gw || !client {
 		t.Fatalf("gateway=%v client=%v，want 客户端 system 原样透传、无网关文本", gw, client)
 	}
@@ -66,7 +76,7 @@ func TestPromptModeHeaderPassthroughOverridesCustom(t *testing.T) {
 
 // 头值大小写/首尾空白容错。
 func TestPromptModeHeaderValueNormalized(t *testing.T) {
-	gw, client := promptModeHeaderOutbound(t, "custom", "GATEWAY-PERSONA-MARKER", "  Passthrough ")
+	gw, client := promptModeHeaderOutbound(t, "custom", "GATEWAY-PERSONA-MARKER", "  Passthrough ", "", nil)
 	if gw || !client {
 		t.Fatalf("gateway=%v client=%v，want passthrough 生效", gw, client)
 	}
@@ -75,7 +85,7 @@ func TestPromptModeHeaderValueNormalized(t *testing.T) {
 // 全局 passthrough + 头 custom：单请求切回人格替换（依赖 normalizePrompt
 // 的 fork 变更：passthrough 全局下文本也已加载）。
 func TestPromptModeHeaderCustomOverridesPassthrough(t *testing.T) {
-	gw, client := promptModeHeaderOutbound(t, "passthrough", "GATEWAY-PERSONA-MARKER", "custom")
+	gw, client := promptModeHeaderOutbound(t, "passthrough", "GATEWAY-PERSONA-MARKER", "custom", "", nil)
 	if !gw || client {
 		t.Fatalf("gateway=%v client=%v，want custom 生效于单请求", gw, client)
 	}
@@ -83,7 +93,7 @@ func TestPromptModeHeaderCustomOverridesPassthrough(t *testing.T) {
 
 // 非法头值：静默回落全局，不打挂请求。
 func TestPromptModeHeaderInvalidFallsBackToGlobal(t *testing.T) {
-	gw, client := promptModeHeaderOutbound(t, "custom", "GATEWAY-PERSONA-MARKER", "yolo")
+	gw, client := promptModeHeaderOutbound(t, "custom", "GATEWAY-PERSONA-MARKER", "yolo", "", nil)
 	if !gw || client {
 		t.Fatalf("gateway=%v client=%v，want 非法值回落全局 custom", gw, client)
 	}
@@ -91,8 +101,44 @@ func TestPromptModeHeaderInvalidFallsBackToGlobal(t *testing.T) {
 
 // 全局 passthrough、无头：透传（原有行为回归）。
 func TestPromptModeGlobalPassthroughNoHeader(t *testing.T) {
-	gw, client := promptModeHeaderOutbound(t, "passthrough", "GATEWAY-PERSONA-MARKER", "")
+	gw, client := promptModeHeaderOutbound(t, "passthrough", "GATEWAY-PERSONA-MARKER", "", "", nil)
 	if gw || !client {
 		t.Fatalf("gateway=%v client=%v，want 全局透传", gw, client)
+	}
+}
+
+// fork: 名单内模型（全名 global:hy4free）+ 无头 → 透传（ERP 专用模型场景）。
+func TestPromptPassthroughModelsListedModelBypassesCustom(t *testing.T) {
+	gw, client := promptModeHeaderOutbound(t, "custom", "GATEWAY-PERSONA-MARKER", "", "global:hy4free",
+		[]string{"global:hy4free"})
+	if gw || !client {
+		t.Fatalf("gateway=%v client=%v，want 名单内模型透传", gw, client)
+	}
+}
+
+// fork: 名单写裸名（hy4free）同样命中带前缀的请求模型。
+func TestPromptPassthroughModelsBareNameMatch(t *testing.T) {
+	gw, client := promptModeHeaderOutbound(t, "custom", "GATEWAY-PERSONA-MARKER", "", "global:hy4free",
+		[]string{"hy4free"})
+	if gw || !client {
+		t.Fatalf("gateway=%v client=%v，want 裸名配置命中", gw, client)
+	}
+}
+
+// fork: 名单命中但头显式给 custom → 头优先于名单。
+func TestPromptPassthroughModelsHeaderStillWins(t *testing.T) {
+	gw, client := promptModeHeaderOutbound(t, "custom", "GATEWAY-PERSONA-MARKER", "custom", "global:hy4free",
+		[]string{"global:hy4free"})
+	if !gw || client {
+		t.Fatalf("gateway=%v client=%v，want 头 custom 优先于名单", gw, client)
+	}
+}
+
+// fork: 名单不含的模型 → 原有全局行为（custom 照常注入，零回归）。
+func TestPromptPassthroughModelsUnlistedKeepsCustom(t *testing.T) {
+	gw, client := promptModeHeaderOutbound(t, "custom", "GATEWAY-PERSONA-MARKER", "", "glm-5.2",
+		[]string{"global:hy4free"})
+	if !gw || client {
+		t.Fatalf("gateway=%v client=%v，want 名单外模型照常 custom", gw, client)
 	}
 }

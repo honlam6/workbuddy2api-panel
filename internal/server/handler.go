@@ -55,6 +55,10 @@ type Config struct {
 	PromptMode string
 	// PromptText custom 模式下注入的系统提示词文本（来自 config.PromptText）。
 	PromptText string
+	// PromptPassthroughModels 模型级透传名单（config prompt.passthrough_models，fork）。
+	// 命中（大小写不敏感，全名或裸名）→ 该模型请求默认透传客户端原始 system；
+	// X-Prompt-Mode 头显式给值时仍优先。
+	PromptPassthroughModels []string
 
 	// GlobalEnabled global realm 路由开关（config global.enabled，缺省 true）。
 	// handler 侧第三道闸（与 main 注入 auth 开关、upstream.GlobalEnabled 呼应）：
@@ -749,6 +753,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	promptMode := h.cfg.PromptMode
 	if v := strings.TrimSpace(strings.ToLower(r.Header.Get("X-Prompt-Mode"))); v == "custom" || v == "append" || v == "passthrough" {
 		promptMode = v
+	} else if modelPassthrough(peek.Model, bareModel, h.cfg.PromptPassthroughModels) {
+		// fork: 模型级透传（prompt.passthrough_models）——名单内模型的所有请求
+		// 默认透传客户端原始 system（ERP 专用模型无需人格伪装）。头显式给值仍优先。
+		promptMode = "passthrough"
 	}
 
 	// 系统提示词改写（出站前、轮转前；每个请求一次）。
@@ -1661,4 +1669,25 @@ func (h *Handler) hintOf(kind upstream.ErrKind, body, bareModel string, hasImage
 		msg = uerr.Msg
 	}
 	return upstream.GatewayHint(kind, msg, h.hintContext(bareModel, hasImage))
+}
+
+// modelPassthrough 报告模型是否命中 prompt.passthrough_models 透传名单（fork）。
+// 大小写不敏感、忽略首尾空白；请求模型名（带 realm 前缀，如 global:hy4free）与
+// 裸名（hy4free）任一命中即算——配置侧两种写法都收。名单为空恒 false（零回归）。
+func modelPassthrough(model, bare string, list []string) bool {
+	if len(list) == 0 {
+		return false
+	}
+	want := make(map[string]struct{}, len(list))
+	for _, m := range list {
+		if t := strings.ToLower(strings.TrimSpace(m)); t != "" {
+			want[t] = struct{}{}
+		}
+	}
+	for _, have := range []string{model, bare} {
+		if _, ok := want[strings.ToLower(strings.TrimSpace(have))]; ok {
+			return true
+		}
+	}
+	return false
 }
